@@ -116,10 +116,9 @@ class FeedForward(nn.Module):
 
 class SignatureScoreModel(nn.Module):
     """
-    Simplified model similar to baseline but predicts clean X_0 directly
-    instead of noise, and generates multiple samples for signature scoring
+    More complex transformer model for better learning capacity
     """
-    def __init__(self, dim, hidden_dim, max_i, num_layers=8, num_samples=8):
+    def __init__(self, dim, hidden_dim, max_i, num_layers=10, num_samples=32):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -129,21 +128,32 @@ class SignatureScoreModel(nn.Module):
         self.i_enc = PositionalEncoding(hidden_dim, max_value=max_i)
 
         self.input_proj = FeedForward(dim, [], hidden_dim)
-        self.proj = FeedForward(3 * hidden_dim, [], hidden_dim, final_activation=nn.ReLU())
+        self.proj = FeedForward(3 * hidden_dim, [hidden_dim], hidden_dim, final_activation=nn.ReLU())
 
-        # Simple transformer layers like baseline
+        # More complex transformer layers
         self.enc_att = []
-        self.i_proj = []
+        self.feed_forward = []
+        self.layer_norms1 = []
+        self.layer_norms2 = []
+        
         for _ in range(num_layers):
-            self.enc_att.append(nn.MultiheadAttention(hidden_dim, num_heads=1, batch_first=True))
-            self.i_proj.append(nn.Linear(3 * hidden_dim, hidden_dim))
+            self.enc_att.append(nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True, dropout=0.1))
+            self.feed_forward.append(FeedForward(hidden_dim, [hidden_dim * 2], hidden_dim, activation=nn.GELU()))
+            self.layer_norms1.append(nn.LayerNorm(hidden_dim))
+            self.layer_norms2.append(nn.LayerNorm(hidden_dim))
+            
         self.enc_att = nn.ModuleList(self.enc_att)
-        self.i_proj = nn.ModuleList(self.i_proj)
+        self.feed_forward = nn.ModuleList(self.feed_forward)
+        self.layer_norms1 = nn.ModuleList(self.layer_norms1)
+        self.layer_norms2 = nn.ModuleList(self.layer_norms2)
 
-        # Multiple output heads for distributional sampling - simpler version
+        # Multiple output heads with more capacity
         self.output_heads = nn.ModuleList([
-            FeedForward(hidden_dim, [], dim) for _ in range(num_samples)
+            FeedForward(hidden_dim, [hidden_dim], dim) for _ in range(num_samples)
         ])
+        
+        # Noise projection for better diversity
+        self.noise_proj = FeedForward(dim, [], hidden_dim)
 
     def forward(self, x, t, i, z=None):
         """
@@ -171,10 +181,19 @@ class SignatureScoreModel(nn.Module):
         # Combine features
         features = self.proj(torch.cat([x_enc, t_enc, i_enc], -1))
 
-        # Apply attention layers (same structure as baseline)
-        for att_layer, i_proj in zip(self.enc_att, self.i_proj):
+        # Apply transformer layers with proper residual connections and layer norms
+        for att_layer, ff_layer, ln1, ln2 in zip(self.enc_att, self.feed_forward, self.layer_norms1, self.layer_norms2):
+            # Multi-head attention with residual connection
+            residual = features
+            features = ln1(features)
             y, _ = att_layer(query=features, key=features, value=features)
-            features = features + torch.relu(y)
+            features = residual + y
+            
+            # Feed forward with residual connection  
+            residual = features
+            features = ln2(features)
+            ff_out = ff_layer(features)
+            features = residual + ff_out
 
         # Generate multiple samples with noise input for diversity
         samples = []
@@ -183,11 +202,11 @@ class SignatureScoreModel(nn.Module):
                 # Use provided noise for this sample
                 noise_input = z[:, head_idx].view(-1, *shape[-2:])  # [B, S, D]
                 # Project noise to feature space
-                noise_features = self.input_proj(noise_input) * 0.1
+                noise_features = self.noise_proj(noise_input) * 0.2
                 diverse_features = features + noise_features
             else:
                 # Generate random noise if not provided
-                noise = torch.randn_like(features) * 0.05
+                noise = torch.randn_like(features) * 0.1
                 diverse_features = features + noise
 
             sample = output_head(diverse_features)
@@ -319,11 +338,11 @@ def signature_score_loss(generated_samples, target_sample, t_single, lambda_para
 # TRAINING SETUP
 # ============================================================================
 
-model = SignatureScoreModel(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=8).to(device).double()
+model = SignatureScoreModel(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=32).to(device).double()
 
-# Optimizer with learning rate decay
-optim = torch.optim.Adam(model.parameters(), lr=1e-4)
-scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.995)  # Multiplicative decay
+# Optimizer with more aggressive learning rate decay
+optim = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.98)  # More aggressive decay
 
 # Training tracking
 training_losses = []
@@ -373,8 +392,17 @@ def get_signature_loss(x_batch, t_batch):
 print("Starting corrected signature scoring diffusion training...")
 print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
 
-batch_size = 4  # Reasonable batch size
-num_epochs = 200  # Reasonable number of epochs
+# Better initialization to prevent bias toward trending down
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=0.5)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+
+model.apply(init_weights)
+
+batch_size = 2  # Smaller batch size due to 32 samples
+num_epochs = 250  # More epochs with stronger decay
 
 for epoch in tqdm(range(num_epochs)):
     # Sample random batch
