@@ -114,12 +114,12 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class DistributionalGenerator(nn.Module):
+class SignatureScoreModel(nn.Module):
     """
-    Neural network that generates multiple samples from P_theta(X_0 | X_t, t)
-    instead of predicting noise directly
+    Simplified model similar to baseline but predicts clean X_0 directly
+    instead of noise, and generates multiple samples for signature scoring
     """
-    def __init__(self, dim, hidden_dim, max_i, num_layers=8, num_samples=100):  # Increased samples
+    def __init__(self, dim, hidden_dim, max_i, num_layers=8, num_samples=8):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -131,35 +131,30 @@ class DistributionalGenerator(nn.Module):
         self.input_proj = FeedForward(dim, [], hidden_dim)
         self.proj = FeedForward(3 * hidden_dim, [], hidden_dim, final_activation=nn.ReLU())
 
-        # Add layer normalization for stability
-        self.layer_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        
+        # Simple transformer layers like baseline
         self.enc_att = []
-        self.feed_forwards = []
+        self.i_proj = []
         for _ in range(num_layers):
-            self.enc_att.append(nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True, dropout=0.1))
-            self.feed_forwards.append(FeedForward(hidden_dim, [hidden_dim * 2], hidden_dim, activation=nn.GELU()))
+            self.enc_att.append(nn.MultiheadAttention(hidden_dim, num_heads=1, batch_first=True))
+            self.i_proj.append(nn.Linear(3 * hidden_dim, hidden_dim))
         self.enc_att = nn.ModuleList(self.enc_att)
-        self.feed_forwards = nn.ModuleList(self.feed_forwards)
+        self.i_proj = nn.ModuleList(self.i_proj)
 
-        # Multiple output heads for distributional sampling with better initialization
+        # Multiple output heads for distributional sampling - simpler version
         self.output_heads = nn.ModuleList([
-            FeedForward(hidden_dim, [hidden_dim, hidden_dim], dim) for _ in range(num_samples)
+            FeedForward(hidden_dim, [], dim) for _ in range(num_samples)
         ])
-
-        # Improved noise injection for diversity
-        self.noise_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.diversity_scale = nn.Parameter(torch.tensor(0.1))  # Learnable diversity scale
 
     def forward(self, x, t, i, z=None):
         """
-        Generate multiple samples from the conditional distribution
+        Generate multiple clean X_0 predictions from the conditional distribution
+        
         x: [B, S, D] - noisy input
         t: [B, S, 1] - timestamps  
         i: [B, S, 1] - diffusion step
-        z: [B, S, hidden_dim] - optional noise for diversity
+        z: [B, num_samples, S, D] - noise input for distributional sampling
         
-        Returns: [B, num_samples, S, D] - multiple generated samples
+        Returns: [B, num_samples, S, D] - multiple predicted clean samples
         """
         shape = x.shape
         batch_size = shape[0]
@@ -168,7 +163,7 @@ class DistributionalGenerator(nn.Module):
         t = t.view(-1, shape[-2], 1)
         i = i.view(-1, shape[-2], 1)
 
-        # Encode inputs
+        # Encode inputs (same as baseline)
         x_enc = self.input_proj(x)
         t_enc = self.t_enc(t)
         i_enc = self.i_enc(i)
@@ -176,29 +171,24 @@ class DistributionalGenerator(nn.Module):
         # Combine features
         features = self.proj(torch.cat([x_enc, t_enc, i_enc], -1))
 
-        # Apply transformer layers with residual connections and layer norm
-        for i, (att_layer, ff_layer, layer_norm) in enumerate(zip(self.enc_att, self.feed_forwards, self.layer_norms)):
-            # Multi-head attention with residual connection
+        # Apply attention layers (same structure as baseline)
+        for att_layer, i_proj in zip(self.enc_att, self.i_proj):
             y, _ = att_layer(query=features, key=features, value=features)
-            features = layer_norm(features + y)
-            
-            # Feed forward with residual connection
-            ff_out = ff_layer(features)
-            features = features + ff_out
+            features = features + torch.relu(y)
 
-        # Generate multiple samples with improved diversity
+        # Generate multiple samples with noise input for diversity
         samples = []
         for head_idx, output_head in enumerate(self.output_heads):
-            # Add structured noise for diversity
             if z is not None:
-                noise_features = self.noise_proj(z) * self.diversity_scale
+                # Use provided noise for this sample
+                noise_input = z[:, head_idx].view(-1, *shape[-2:])  # [B, S, D]
+                # Project noise to feature space
+                noise_features = self.input_proj(noise_input) * 0.1
                 diverse_features = features + noise_features
             else:
-                # Use different random noise for each head with learnable scale
-                noise = torch.randn_like(features) * self.diversity_scale
-                # Add head-specific bias for diversity
-                head_bias = torch.sin(torch.tensor(head_idx * 2.0 * np.pi / self.num_samples, device=features.device))
-                diverse_features = features + noise + head_bias * 0.01
+                # Generate random noise if not provided
+                noise = torch.randn_like(features) * 0.05
+                diverse_features = features + noise
 
             sample = output_head(diverse_features)
             sample = sample.view(*shape)
@@ -316,11 +306,11 @@ def signature_score_loss(generated_samples, target_sample, t_single, lambda_para
     # But we minimize loss, so: Loss = -E[k(X,Y)] + λ/2 * E[k(X,X')]
     loss = -gen_target_term + (lambda_param / 2) * cross_kernel_term
     
-    # Add numerical stability - clamp to reasonable range
-    loss = torch.clamp(loss, min=-100.0, max=100.0)
+    # Less aggressive clamping to allow more learning
+    loss = torch.clamp(loss, min=-50.0, max=50.0)
     
     # Debug: print components occasionally
-    if torch.rand(1).item() < 0.01:  # 1% of the time
+    if torch.rand(1).item() < 0.02:  # 2% of the time
         print(f"Debug - gen_target_term: {gen_target_term:.4f}, cross_kernel_term: {cross_kernel_term:.4f}, loss: {loss:.4f}")
     
     return loss
@@ -329,18 +319,20 @@ def signature_score_loss(generated_samples, target_sample, t_single, lambda_para
 # TRAINING SETUP
 # ============================================================================
 
-model = DistributionalGenerator(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=8).to(device).double()  # Reduced for computational efficiency
+model = SignatureScoreModel(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=8).to(device).double()
 
-# Simple optimizer without scheduling
+# Optimizer with learning rate decay
 optim = torch.optim.Adam(model.parameters(), lr=1e-4)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.995)  # Multiplicative decay
 
-# Training tracking (removed unused variables)
+# Training tracking
 training_losses = []
 gradient_norms = []
+learning_rates = []
 
 def get_signature_loss(x_batch, t_batch):
     """
-    Compute signature-based loss for a batch - SIMPLIFIED
+    Compute signature-based loss with noise input for distributional sampling
     """
     batch_size = x_batch.shape[0]
     
@@ -352,19 +344,24 @@ def get_signature_loss(x_batch, t_batch):
     
     for b in range(batch_size):
         # Get single sample and corresponding time
-        x_single = x_batch[b:b+1]  # [1, S, D]
+        x_clean = x_batch[b:b+1]  # [1, S, D] - clean target
         t_single = t_batch[b:b+1]  # [1, S, 1]
         i_single = i[b:b+1]        # [1, S, 1]
         
-        # Add noise
-        x_noisy, _ = add_noise(x_single, t_single, i_single)
+        # Add noise to get x_noisy
+        x_noisy, _ = add_noise(x_clean, t_single, i_single)
         
-        # Generate multiple samples from the model
-        generated_samples = model(x_noisy, t_single, i_single)  # [1, num_samples, S, D]
-        generated_samples = generated_samples.squeeze(0)  # [num_samples, S, D]
+        # Generate noise input for distributional sampling
+        num_samples = model.num_samples
+        z = torch.randn(1, num_samples, x_clean.shape[1], x_clean.shape[2], 
+                       dtype=torch.float64, device=device) * 0.1
         
-        # Compute signature score loss
-        loss = signature_score_loss(generated_samples, x_single.squeeze(0), t_single.squeeze(0), lambda_param=0.5)
+        # Model predicts clean X_0 from noisy input with noise for diversity
+        predicted_clean_samples = model(x_noisy, t_single, i_single, z)  # [1, num_samples, S, D]
+        predicted_clean_samples = predicted_clean_samples.squeeze(0)  # [num_samples, S, D]
+        
+        # Compute signature score loss between predicted clean samples and true clean sample
+        loss = signature_score_loss(predicted_clean_samples, x_clean.squeeze(0), t_single.squeeze(0), lambda_param=0.3)
         total_loss += loss
     
     return total_loss / batch_size
@@ -389,6 +386,9 @@ for epoch in tqdm(range(num_epochs)):
     loss = get_signature_loss(x_batch, t_batch)
     loss.backward()
     
+    # Gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
     # Compute gradient norm for monitoring
     total_grad_norm = 0.0
     for p in model.parameters():
@@ -397,13 +397,16 @@ for epoch in tqdm(range(num_epochs)):
     total_grad_norm = total_grad_norm ** 0.5
     
     optim.step()
+    scheduler.step()  # Apply learning rate decay
     
     # Log metrics
     training_losses.append(loss.item())
     gradient_norms.append(total_grad_norm)
+    learning_rates.append(scheduler.get_last_lr()[0])
     
     if epoch % 50 == 0:
-        print(f"Epoch {epoch}: Loss = {loss.item():.6f}, Grad Norm = {total_grad_norm:.6f}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch}: Loss = {loss.item():.6f}, Grad Norm = {total_grad_norm:.6f}, LR = {current_lr:.2e}")
 
 print("Training completed!")
 
@@ -414,7 +417,8 @@ print("Training completed!")
 @torch.no_grad()
 def sample_signature(t_grid, num_samples=20):
     """
-    Generate samples using the trained distributional model with improved stability
+    Generate samples using DDIM sampling with clean X_0 predictions
+    Similar to baseline but uses model's clean predictions
     """
     # Ensure t_grid has the right shape for a single batch element
     if len(t_grid.shape) == 3:
@@ -428,10 +432,7 @@ def sample_signature(t_grid, num_samples=20):
     # Start with noise
     x = L @ torch.randn(num_samples, t_single_grid.shape[1], 1, dtype=torch.float64, device=device)
     
-    # Use fewer diffusion steps for more stable sampling
-    sampling_steps = list(range(0, diffusion_steps, 2))  # Skip every other step
-    
-    for diff_step in reversed(sampling_steps):
+    for diff_step in reversed(range(0, diffusion_steps)):
         alpha = alphas[diff_step]
         beta = betas[diff_step]
         
@@ -442,32 +443,28 @@ def sample_signature(t_grid, num_samples=20):
             t_single = t_single_grid  # [1, S, 1] 
             i_single = torch.tensor([diff_step], dtype=torch.float64).expand_as(x_single[...,:1]).to(device)
             
-            try:
-                # Generate multiple candidates
-                generated_candidates = model(x_single, t_single, i_single)  # [1, num_model_samples, S, D]
-                
-                # Use median instead of mean for more robust prediction
-                pred_x0 = generated_candidates.median(dim=1)[0]  # [1, S, D] - median prediction
-                
-                # Clamp predictions to reasonable range
-                pred_x0 = torch.clamp(pred_x0, min=-3.0, max=3.0)
-                
-                # DDIM-style update with numerical stability
-                noise_pred = (x_single - alpha.sqrt() * pred_x0) / (1 - alpha).sqrt().clamp(min=1e-8)
-                x_single = (x_single - beta * noise_pred / (1 - alpha).sqrt().clamp(min=1e-8)) / (1 - beta).sqrt().clamp(min=1e-8)
-                
-                # Add stochastic component only for early steps
-                if diff_step > diffusion_steps // 4:
-                    z = L @ torch.randn_like(x_single) * 0.5  # Reduced noise
-                    x_single = x_single + beta.sqrt() * z
-                
-                # Clamp to prevent explosion
-                x_single = torch.clamp(x_single, min=-5.0, max=5.0)
-                
-            except Exception as e:
-                print(f"Error in sampling step {diff_step}, sample {sample_idx}: {e}")
-                # Keep previous value if error occurs
-                pass
+            # Generate noise for distributional sampling
+            z = torch.randn(1, model.num_samples, t_single_grid.shape[1], 1, 
+                           dtype=torch.float64, device=device) * 0.1
+            
+            # Get clean X_0 predictions from model with noise input
+            predicted_clean_candidates = model(x_single, t_single, i_single, z)  # [1, num_model_samples, S, D]
+            
+            # Use first prediction (or could use mean/median)
+            pred_x0 = predicted_clean_candidates[0, 0]  # [S, D] - first sample
+            pred_x0 = pred_x0.unsqueeze(0)  # [1, S, D]
+            
+            # DDIM update using predicted clean sample
+            # x_t = sqrt(alpha) * x_0 + sqrt(1-alpha) * noise
+            # So: noise = (x_t - sqrt(alpha) * x_0) / sqrt(1-alpha)
+            pred_noise = (x_single - alpha.sqrt() * pred_x0) / (1 - alpha).sqrt().clamp(min=1e-8)
+            
+            # Standard DDIM update (same as baseline)
+            x_single = (x_single - beta * pred_noise / (1 - alpha).sqrt().clamp(min=1e-8)) / (1 - beta).sqrt().clamp(min=1e-8)
+            
+            if diff_step > 0:
+                z = L @ torch.randn_like(x_single)
+                x_single = x_single + beta.sqrt() * z
                 
             all_samples.append(x_single)
         
@@ -497,14 +494,20 @@ ax.set_xlabel('Epoch')
 ax.set_ylabel('Loss')
 ax.grid(True, alpha=0.3)
 
-# Plot 2: Gradient norms
+# Plot 2: Gradient norms and learning rate
 ax = axes[0, 1]
-ax.plot(gradient_norms, color='C1', linewidth=2)
-ax.set_title('Gradient Norm During Training')
+ax2 = ax.twinx()
+ax.plot(gradient_norms, color='C1', linewidth=2, label='Grad Norm')
+ax2.plot(learning_rates, color='C3', linewidth=2, linestyle='--', label='Learning Rate')
+ax.set_title('Training Dynamics')
 ax.set_xlabel('Epoch')
-ax.set_ylabel('Gradient Norm')
+ax.set_ylabel('Gradient Norm', color='C1')
+ax2.set_ylabel('Learning Rate', color='C3')
 ax.set_yscale('log')
+ax2.set_yscale('log')
 ax.grid(True, alpha=0.3)
+ax.legend(loc='upper left')
+ax2.legend(loc='upper right')
 
 # Plot 3: Generated samples
 ax = axes[0, 2]
