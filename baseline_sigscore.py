@@ -119,7 +119,7 @@ class DistributionalGenerator(nn.Module):
     Neural network that generates multiple samples from P_theta(X_0 | X_t, t)
     instead of predicting noise directly
     """
-    def __init__(self, dim, hidden_dim, max_i, num_layers=8, num_samples=16):  # Increased samples
+    def __init__(self, dim, hidden_dim, max_i, num_layers=8, num_samples=100):  # Increased samples
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -222,7 +222,7 @@ def compute_signature_kernel_pairwise(path1, path2):
         path1_batch = path1.unsqueeze(0)  # [1, S, D+1]
         path2_batch = path2.unsqueeze(0)  # [1, S, D+1]
         
-        kernel_val = pysiglib.sig_kernel(path1_batch, path2_batch, dyadic_order=2)
+        kernel_val = pysiglib.sig_kernel(path1_batch, path2_batch, dyadic_order=3)
         
         # Extract scalar value
         if kernel_val.dim() == 0:
@@ -258,114 +258,97 @@ def compute_signature_kernel_matrix(samples_batch, t_batch):
 
 def signature_score_loss(generated_samples, target_sample, t_single, lambda_param=0.5):
     """
-    Compute signature scoring loss with improved stability
-    generated_samples: [num_samples, S, D] - samples from P_theta
-    target_sample: [S, D] - ground truth sample
-    t_single: [S, 1] - time points
-    lambda_param: weighting parameter in [0,1]
+    Compute signature scoring loss - CORRECTED VERSION
     
-    Returns: scalar loss
+    The signature score S_λ(P,Y) = λ/2 * E[k(X,X')] - E[k(X,Y)] should be MINIMIZED
+    Since we want the generated distribution P to match the target Y, we want:
+    - High similarity between generated samples and target: maximize E[k(X,Y)]
+    - Controlled diversity among generated samples: moderate E[k(X,X')]
+    
+    So the LOSS to minimize is: -S_λ(P,Y) = E[k(X,Y)] - λ/2 * E[k(X,X')]
     """
     num_samples = generated_samples.shape[0]
     device = generated_samples.device
     
-    # Expand target to match batch dimension for kernel computation
-    target_expanded = target_sample.unsqueeze(0)  # [1, S, D]
-    t_expanded = t_single.unsqueeze(0)  # [1, S, 1]
+    # 1. Compute E[k(X_i, X_j)] for i≠j (diversity among generated samples)
+    cross_kernel_sum = 0.0
+    cross_kernel_count = 0
     
-    # Compute kernel terms with numerical stability
-    # 1. Between generated samples: E[k(X_i, X_j)] for i≠j
     if num_samples > 1:
-        t_gen = t_single.unsqueeze(0).expand(num_samples, -1, -1)  # [num_samples, S, 1]
-        gen_kernel_matrix = compute_signature_kernel_matrix(generated_samples, t_gen)
+        for i in range(num_samples):
+            for j in range(i+1, num_samples):
+                # Get two different generated samples
+                sample_i = generated_samples[i:i+1]  # [1, S, D]
+                sample_j = generated_samples[j:j+1]  # [1, S, D]
+                
+                # Combine for kernel computation
+                combined = torch.cat([sample_i, sample_j], dim=0)  # [2, S, D]
+                t_combined = torch.cat([t_single.unsqueeze(0), t_single.unsqueeze(0)], dim=0)  # [2, S, 1]
+                
+                # Compute kernel
+                kernel_matrix = compute_signature_kernel_matrix(combined, t_combined)
+                cross_kernel_sum += kernel_matrix[0, 1]
+                cross_kernel_count += 1
         
-        # Extract off-diagonal elements (i≠j terms) with better numerical stability
-        mask = ~torch.eye(num_samples, dtype=torch.bool, device=device)
-        if mask.sum() > 0:
-            cross_kernel_term = gen_kernel_matrix[mask].mean()
-            # Add small regularization to prevent extreme values
-            cross_kernel_term = torch.clamp(cross_kernel_term, min=-10.0, max=10.0)
-        else:
-            cross_kernel_term = torch.tensor(0.0, device=device)
+        cross_kernel_term = cross_kernel_sum / cross_kernel_count if cross_kernel_count > 0 else torch.tensor(0.0, device=device)
     else:
         cross_kernel_term = torch.tensor(0.0, device=device)
     
-    # 2. Between generated and target: E[k(X_i, Y)] - More stable computation
-    gen_target_kernels = []
+    # 2. Compute E[k(X_i, Y)] (similarity between generated samples and target)
+    gen_target_sum = 0.0
     
-    # Batch computation for efficiency
-    all_gen_samples = generated_samples  # [num_samples, S, D]
-    all_targets = target_expanded.expand(num_samples, -1, -1)  # [num_samples, S, D]
-    all_t = t_expanded.expand(num_samples, -1, -1)  # [num_samples, S, 1]
-    
-    # Compute all cross-kernels in batches for stability
-    batch_size = min(8, num_samples)  # Process in smaller batches
-    gen_target_vals = []
-    
-    for i in range(0, num_samples, batch_size):
-        end_idx = min(i + batch_size, num_samples)
-        batch_gen = all_gen_samples[i:end_idx]
-        batch_target = all_targets[i:end_idx]
-        batch_t = all_t[i:end_idx]
+    for i in range(num_samples):
+        gen_sample = generated_samples[i:i+1]  # [1, S, D]
+        target_expanded = target_sample.unsqueeze(0)  # [1, S, D]
         
-        # Compute cross-kernels for this batch
-        for j in range(batch_gen.shape[0]):
-            gen_sample = batch_gen[j:j+1]  # [1, S, D]
-            target_sample_j = batch_target[j:j+1]  # [1, S, D]
-            t_sample = batch_t[j:j+1]  # [1, S, 1]
-            
-            combined_samples = torch.cat([gen_sample, target_sample_j], dim=0)  # [2, S, D]
-            combined_t = torch.cat([t_sample, t_sample], dim=0)  # [2, S, 1]
-            
-            kernel_matrix = compute_signature_kernel_matrix(combined_samples, combined_t)
-            kernel_val = kernel_matrix[0, 1]
-            
-            # Clamp for numerical stability
-            kernel_val = torch.clamp(kernel_val, min=-10.0, max=10.0)
-            gen_target_vals.append(kernel_val)
+        # Combine for kernel computation
+        combined = torch.cat([gen_sample, target_expanded], dim=0)  # [2, S, D]
+        t_combined = torch.cat([t_single.unsqueeze(0), t_single.unsqueeze(0)], dim=0)  # [2, S, 1]
+        
+        # Compute kernel
+        kernel_matrix = compute_signature_kernel_matrix(combined, t_combined)
+        gen_target_sum += kernel_matrix[0, 1]
     
-    gen_target_term = torch.stack(gen_target_vals).mean()
+    gen_target_term = gen_target_sum / num_samples
     
-    # Signature score: λ/2 * E[k(X,X')] - E[k(X,Y)]
-    # Add small regularization term to prevent collapse
-    regularization = 0.001 * torch.mean(torch.var(generated_samples, dim=0))
-    score = (lambda_param / 2) * cross_kernel_term - gen_target_term + regularization
+    # CORRECTED LOSS: We want to MAXIMIZE similarity to target and control diversity
+    # Loss = -S_λ(P,Y) = E[k(X,Y)] - λ/2 * E[k(X,X')] 
+    # But we minimize loss, so: Loss = -E[k(X,Y)] + λ/2 * E[k(X,X')]
+    loss = -gen_target_term + (lambda_param / 2) * cross_kernel_term
     
-    # Additional stability: clamp final score
-    score = torch.clamp(score, min=-5.0, max=5.0)
+    # Add numerical stability - clamp to reasonable range
+    loss = torch.clamp(loss, min=-100.0, max=100.0)
     
-    return score
+    # Debug: print components occasionally
+    if torch.rand(1).item() < 0.01:  # 1% of the time
+        print(f"Debug - gen_target_term: {gen_target_term:.4f}, cross_kernel_term: {cross_kernel_term:.4f}, loss: {loss:.4f}")
+    
+    return loss
 
 # ============================================================================
 # TRAINING SETUP
 # ============================================================================
 
-model = DistributionalGenerator(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=16).to(device).double()
+model = DistributionalGenerator(dim=1, hidden_dim=64, max_i=diffusion_steps, num_samples=8).to(device).double()  # Reduced for computational efficiency
 
-# Improved optimizer with better stability
-optim = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4, betas=(0.9, 0.999))
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optim, T_0=50, T_mult=2, eta_min=1e-6)
+# Simple optimizer without scheduling
+optim = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# Training tracking
+# Training tracking (removed unused variables)
 training_losses = []
 gradient_norms = []
-cross_kernel_terms = []
-gen_target_terms = []
-learning_rates = []
 
 def get_signature_loss(x_batch, t_batch):
     """
-    Compute signature-based loss for a batch with improved stability
+    Compute signature-based loss for a batch - SIMPLIFIED
     """
     batch_size = x_batch.shape[0]
     
-    # Sample random diffusion steps with bias toward middle steps for stability
-    # Avoid very early/late diffusion steps which can be unstable
-    i = torch.randint(10, diffusion_steps-10, size=(batch_size,), dtype=torch.int64)
+    # Sample random diffusion steps
+    i = torch.randint(0, diffusion_steps, size=(batch_size,), dtype=torch.int64)
     i = i.view(-1, 1, 1).expand_as(x_batch[...,:1]).to(x_batch).double()
     
     total_loss = 0.0
-    valid_losses = 0
     
     for b in range(batch_size):
         # Get single sample and corresponding time
@@ -380,45 +363,21 @@ def get_signature_loss(x_batch, t_batch):
         generated_samples = model(x_noisy, t_single, i_single)  # [1, num_samples, S, D]
         generated_samples = generated_samples.squeeze(0)  # [num_samples, S, D]
         
-        try:
-            # Compute signature score loss
-            loss = signature_score_loss(generated_samples, x_single.squeeze(0), t_single.squeeze(0), lambda_param=0.3)
-            
-            # Check for valid loss
-            if torch.isfinite(loss):
-                total_loss += loss
-                valid_losses += 1
-            else:
-                print(f"Warning: Invalid loss detected at batch {b}")
-                
-        except Exception as e:
-            print(f"Error computing loss for batch {b}: {e}")
-            continue
+        # Compute signature score loss
+        loss = signature_score_loss(generated_samples, x_single.squeeze(0), t_single.squeeze(0), lambda_param=0.5)
+        total_loss += loss
     
-    if valid_losses > 0:
-        return total_loss / valid_losses
-    else:
-        return torch.tensor(0.0, device=x_batch.device, requires_grad=True)
+    return total_loss / batch_size
 
 # ============================================================================
 # TRAINING LOOP
 # ============================================================================
 
-print("Starting improved signature scoring diffusion training...")
+print("Starting corrected signature scoring diffusion training...")
 print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
 
-batch_size = 2  # Even smaller batch size for better signature kernel estimation
-num_epochs = 300  # More epochs with smaller learning rate
-warmup_epochs = 50
-
-# Initialize model parameters more carefully
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight, gain=0.1)
-        if m.bias is not None:
-            torch.nn.init.zeros_(m.bias)
-
-model.apply(init_weights)
+batch_size = 4  # Reasonable batch size
+num_epochs = 200  # Reasonable number of epochs
 
 for epoch in tqdm(range(num_epochs)):
     # Sample random batch
@@ -427,40 +386,24 @@ for epoch in tqdm(range(num_epochs)):
     t_batch = t[batch_indices]
     
     optim.zero_grad()
-    
-    # Compute loss with gradient accumulation for stability
     loss = get_signature_loss(x_batch, t_batch)
+    loss.backward()
     
-    if torch.isfinite(loss) and loss.item() != 0.0:
-        loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        # Compute gradient norm for monitoring
-        total_grad_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                total_grad_norm += p.grad.data.norm(2).item() ** 2
-        total_grad_norm = total_grad_norm ** 0.5
-        
-        optim.step()
-        scheduler.step()
-        
-        # Log metrics
-        training_losses.append(loss.item())
-        gradient_norms.append(total_grad_norm)
-        learning_rates.append(scheduler.get_last_lr()[0])
-        
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch}: Loss = {loss.item():.6f}, Grad Norm = {total_grad_norm:.6f}, LR = {scheduler.get_last_lr()[0]:.2e}")
-    else:
-        print(f"Skipping epoch {epoch} due to invalid loss: {loss.item()}")
-        # Still step scheduler
-        scheduler.step()
-        training_losses.append(0.0)
-        gradient_norms.append(0.0)
-        learning_rates.append(scheduler.get_last_lr()[0])
+    # Compute gradient norm for monitoring
+    total_grad_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_grad_norm += p.grad.data.norm(2).item() ** 2
+    total_grad_norm = total_grad_norm ** 0.5
+    
+    optim.step()
+    
+    # Log metrics
+    training_losses.append(loss.item())
+    gradient_norms.append(total_grad_norm)
+    
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch}: Loss = {loss.item():.6f}, Grad Norm = {total_grad_norm:.6f}")
 
 print("Training completed!")
 
@@ -554,20 +497,14 @@ ax.set_xlabel('Epoch')
 ax.set_ylabel('Loss')
 ax.grid(True, alpha=0.3)
 
-# Plot 2: Gradient norms and learning rate
+# Plot 2: Gradient norms
 ax = axes[0, 1]
-ax2 = ax.twinx()
-ax.plot(gradient_norms, color='C1', linewidth=2, label='Grad Norm')
-ax2.plot(learning_rates, color='C3', linewidth=2, linestyle='--', label='Learning Rate')
-ax.set_title('Training Dynamics')
+ax.plot(gradient_norms, color='C1', linewidth=2)
+ax.set_title('Gradient Norm During Training')
 ax.set_xlabel('Epoch')
-ax.set_ylabel('Gradient Norm', color='C1')
-ax2.set_ylabel('Learning Rate', color='C3')
+ax.set_ylabel('Gradient Norm')
 ax.set_yscale('log')
-ax2.set_yscale('log')
 ax.grid(True, alpha=0.3)
-ax.legend(loc='upper left')
-ax2.legend(loc='upper right')
 
 # Plot 3: Generated samples
 ax = axes[0, 2]
