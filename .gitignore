@@ -1,1 +1,8 @@
 *.tex
+scaires
+slurmres
+old_results/
+oldplots/
+__pycache__/
+gifs
+*.png

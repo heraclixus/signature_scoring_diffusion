@@ -9,19 +9,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 torch.manual_seed(123)
-
 N, T = 200, 100
 t = torch.rand(N, T, 1, dtype=torch.float64).sort(1)[0].to(device)
 x = torch.sin(10 * t + 2 * np.pi * torch.rand(N, 1, 1, dtype=torch.float64).to(t))
 
 for i in range(10):
     plt.plot(t[i,:,0].cpu().numpy(), x[i,:,0].cpu().numpy(), color='C0', alpha=1 / (i + 1))
-plt.title('10 samples from the dataset\nEach curve is one "data point"')
-plt.xlabel('t')
-plt.ylabel('x')
-plt.savefig('data.png')
-plt.close()
-
 
 def get_betas(steps):
     beta_start, beta_end = 1e-4, 0.2
@@ -195,10 +188,25 @@ def sample(t):
 # Generate samples and compare with ground truth
 print("\nGenerating samples and computing metrics...")
 
-# Generate more samples for better statistical analysis
-t_grid = torch.linspace(0, 1, 200, dtype=torch.float64).view(1, -1, 1).to(device) # Note that we can use different sequence length here without any issues
-num_generated_samples = 100  # Generate more samples for robust statistics
-samples = sample(t_grid.repeat(num_generated_samples, 1, 1))
+# Generate samples with different resolutions
+print("Testing different sampling resolutions...")
+
+# Fine-grained sampling (200 points)
+t_grid_fine = torch.linspace(0, 1, 200, dtype=torch.float64).view(1, -1, 1).to(device)
+num_generated_samples = 100
+samples_fine = sample(t_grid_fine.repeat(num_generated_samples, 1, 1))
+
+# Coarse sampling (50 points) 
+t_grid_coarse = torch.linspace(0, 1, 50, dtype=torch.float64).view(1, -1, 1).to(device)
+samples_coarse = sample(t_grid_coarse.repeat(num_generated_samples, 1, 1))
+
+# Medium sampling (same as training - 100 points)
+t_grid_medium = torch.linspace(0, 1, 100, dtype=torch.float64).view(1, -1, 1).to(device)
+samples_medium = sample(t_grid_medium.repeat(num_generated_samples, 1, 1))
+
+# Use fine-grained for main analysis
+samples = samples_fine
+t_grid = t_grid_fine
 
 # Import libraries for quantitative comparison
 try:
@@ -262,10 +270,10 @@ if METRICS_AVAILABLE:
     print(f"Wasserstein Distance (Trajectory Means): {wd_means:.6f}")
     print(f"Wasserstein Distance (Trajectory Stds):  {wd_stds:.6f}")
 
-# Create comprehensive visualization
+# Create comprehensive visualization including sampling resolution comparison
 print("\n🎨 Creating comprehensive visualization...")
 
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(3, 3, figsize=(18, 16))
 
 # Plot 1: Sample trajectories (first 10)
 ax = axes[0, 0]
@@ -338,30 +346,3 @@ ax.set_xlabel('t')
 ax.set_ylabel('x')
 ax.legend()
 ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig('example_comprehensive_analysis.png', dpi=150, bbox_inches='tight')
-plt.close()
-
-# Also save the simple version for compatibility
-plt.figure(figsize=(10, 6))
-for i in range(10):
-    plt.plot(t_grid.squeeze().detach().cpu().numpy(), samples[i].squeeze().detach().cpu().numpy(), color='C0', alpha=1 / (i + 1))
-plt.title('10 new realizations')
-plt.xlabel('t')
-plt.ylabel('x')
-plt.savefig('samples.png')
-plt.close()
-
-print("✅ Analysis complete!")
-print("\nFiles generated:")
-print("- samples.png (original format)")
-print("- example_comprehensive_analysis.png (detailed comparison)")
-
-if METRICS_AVAILABLE:
-    print(f"\n🏆 FINAL RESULTS:")
-    print(f"Wasserstein Distance to Ground Truth: {wasserstein_dist:.6f}")
-    print(f"Lower values indicate better similarity to ground truth data")
-else:
-    print("\nInstall scipy and sklearn for quantitative metrics:")
-    print("pip install scipy scikit-learn")

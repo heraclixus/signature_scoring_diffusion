@@ -1,12 +1,12 @@
 # Signature Scoring Diffusion for Time Series Generation
 
-This repository implements a novel approach to time series generation that combines diffusion models with signature-based scoring functions. The work extends traditional diffusion models by replacing standard noise prediction with distributional learning using signature kernels.
+> This repository implements a novel approach to time series generation that combines diffusion models with signature-based scoring functions. The work extends traditional diffusion models by replacing standard noise prediction with distributional learning using signature kernels and proper reparameterization tricks in path space.
 
 ## Overview
 
 ### Baseline Implementation (`baseline_tsdiff.py`)
 
-The baseline implements a **Gaussian Process-based Diffusion Model** for time series generation with the following key components:
+The baseline implements model is the [tsdiff](https://github.com/mbilos/tsdiff/) model.
 
 #### Data Generation
 - **Synthetic Dataset**: 200 sinusoidal time series with random phases: `x = sin(10t + 2π·rand)`
@@ -28,16 +28,10 @@ The baseline implements a **Gaussian Process-based Diffusion Model** for time se
 - **DDPM Sampling**: Iterative denoising with GP-correlated random noise
 - **Comprehensive Evaluation**: Wasserstein distance, statistical comparisons, visual analysis
 
-### Results
-- Generates realistic sinusoidal trajectories matching training distribution
-- Quantitative metrics include distributional similarity and trajectory statistics
-- Flexible sampling at different temporal resolutions
-
----
 
 ## Proposed Extension: Signature Scoring Diffusion
 
-### Theoretical Framework (`method.tex`)
+### Mathematical Framework
 
 The proposed method introduces a **distributional approach** to diffusion models using signature-based scoring functions:
 
@@ -74,14 +68,6 @@ Instead of learning `E[X₀|Xₜ]` (point estimates), the model learns the **ful
 - **Deterministic Update**: `Xₛ = √αₛ X̃₀ + √(1-αₛ) Dₜ`
 - **Flexible Scheduling**: Supports coarse-grained time discretization
 
-### Advantages of Signature Scoring
-
-1. **Rich Path Characterization**: Signatures capture geometric and topological properties
-2. **Distributional Learning**: Models full conditional distributions, not just means
-3. **Temporal Structure**: Naturally handles irregular sampling and variable lengths
-4. **Theoretical Foundation**: Grounded in rough path theory and stochastic analysis
-
----
 
 ## Key Differences
 
@@ -95,91 +81,52 @@ Instead of learning `E[X₀|Xₜ]` (point estimates), the model learns the **ful
 
 ---
 
-## File Structure
+## Current Implementation Status
 
-```
-signature_scoring_diffusion/
-├── baseline_tsdiff.py      # GP-based diffusion baseline
-├── baseline_sigscore.py    # (To be implemented) Signature scoring version
-├── method.tex             # Theoretical framework
-└── README.md              # This file
-```
+### **Reparameterization Trick in Path Space**
 
-## Dependencies
+The signature scoring models uses VAE-style reparameterization:
 
-```bash
-pip install torch numpy matplotlib tqdm scipy scikit-learn
-```
+#### **Mathematical Framework**
+- **Deterministic Component**: `base = transformer(Xₜ, t, i)` 
+- **Stochastic Component**: `Z ~ OU(θ=2.0, σ=0.8)` (Ornstein-Uhlenbeck process)
+- **Reparameterization**: `X₀ = base + transform(Z)` (like μ + σ⊙z in VAEs)
+- **Fair Comparison**: Same transformer architecture as baseline (8 layers, 1 head, same parameters)
+- **OU Noise**: Independent OU processes for each sample (respects temporal structure)
+
+### **Debugging and Monitoring**
+#### **Training Diagnostics**
+- **Loss Decrease Monitoring**: Warns if loss not improving over 20-epoch windows
+- **Strict Properness Testing**: Verifies signature score behaves as proper scoring rule
+- **Component Analysis**: Breaks down signature loss into target and cross terms
+- **Real-time Validation**: Tests during training every 100 epochs
 
 ## Usage
 
-### Run Baseline
+### **Run Experiments**
+
+#### **Baseline Diffusion**
 ```bash
 python baseline_tsdiff.py
 ```
-Generates:
-- `data.png`: Original training data visualization
-- `samples.png`: Generated samples
-- `example_comprehensive_analysis.png`: Detailed comparison plots
+Generates standard diffusion model results for comparison.
 
-### Implementation Results
+#### **Baseline Signature Scoring**
+```bash
+python baseline_sigscore.py
+```
 
-#### Signature Scoring Implementation (`baseline_sigscore.py`)
-✅ **Successfully implemented and trained!**
+## Current Challenges
 
-**Key Features Implemented:**
-- **SignatureScoreModel**: Simplified neural network generating 8 samples from P(X₀|Xₜ,t)
-- **Signature Kernel Integration**: Using `pysiglib.torch_api` for path signature computations  
-- **Signature Score Loss**: Corrected implementation: Loss = -E[k_sig(X,Y)] + (λ/2)E[k_sig(X,X')]
-- **DDIM-style Sampling**: Clean X₀ prediction with proper diffusion inversion
-
-**Training Results:**
-- **Final Loss**: -50.0 (converged and clamped signature score)
-- **Training Epochs**: 200 epochs (~8.5 minutes)
-- **Gradient Dynamics**: Stable convergence (gradients → 0)
-- **Architecture**: 8-layer transformer with 8-sample heads (245K parameters)
-- **Parameter Match**: Nearly identical to baseline (245K vs 245K parameters)
-
-**Generated Outputs:**
-- `data_sigscore.png`: Training data visualization
-- `samples_sigscore.png`: Generated time series samples  
-- `signature_scoring_analysis.png`: Comprehensive training dynamics and comparison plots
-
-**Key Implementation Fixes:**
-- **Corrected Loss Sign**: Fixed signature score to properly minimize -E[k_sig(X,Y)] + (λ/2)E[k_sig(X,X')]
-- **Simplified Architecture**: Reduced from 417K to 245K parameters matching baseline complexity
-- **Clean X₀ Prediction**: Model now predicts clean samples directly instead of noise
-- **Proper Sampling Space**: DDIM sampling ensures generated samples are in same space as ground truth
-- **Numerical Stability**: Loss clamping to [-100, 100] prevents gradient explosion
-- **Computational Efficiency**: 8 samples provide good signature estimation vs. computational cost
-
-#### Performance Comparison
-
-| Metric | Baseline (Noise Prediction) | Signature Scoring |
-|--------|----------------------------|------------------|
-| **Training Time** | ~500 epochs | **200 epochs** |
-| **Loss Type** | MSE (noise) | **Signature score** |
-| **Final Loss** | ~0.01 (MSE) | **-50.0 (converged)** |
-| **Parameters** | 245K | **245K (matched!)** |
-| **Sample Quality** | Good sinusoidal fit | **Path-level structure** |
-| **Prediction Target** | Noise ε | **Clean X₀** |
-| **Gradient Stability** | Standard | **Excellent (→0)** |
-| **Path Preservation** | Implicit | **Explicit via signatures** |
-
-### Future Work
-- Quantitative comparison using Wasserstein distance and path metrics
-- Evaluate signature method on real-world time series datasets
-- Extend to multivariate and longer sequences
-- Optimize signature kernel computations for scalability
-
----
+### **Training Dynamics Issues**
+- **Loss Stagnation**: Some configurations show non-decreasing loss
+- **Strict Properness**: Needs verification during training
+- **Component Balance**: Target vs cross terms may be imbalanced
 
 ## References
-
 The method builds upon:
 - **DSPD**: Biloš et al. (2023) - Modeling Temporal Data as Continuous Path
 - **Distributional Diffusion**: De Bortoli et al. (2025) - Distributional Diffusion Models and Scoring
 - **Neural SDEs**: Issa et al. (2023) - Non-adversarial Training of Neural SDEs
 - **DDIM Sampling**: Song et al. (2022) - Denoising Diffusion Implicit Models
-
-The signature scoring approach offers a principled way to incorporate path-level information into diffusion models, potentially leading to better temporal structure preservation and more realistic time series generation.
+- **Signature Methods**: Chevyrev & Oberhauser (2022) - Signature methods in machine learning
