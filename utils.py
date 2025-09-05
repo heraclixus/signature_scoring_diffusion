@@ -126,12 +126,15 @@ def get_cached_ou_noise(pregenerated_noise: List[torch.Tensor], target_shape: Tu
 
 
 class TrainingLogger:
-    """Logger for training metrics and progress"""
+    """Enhanced logger for training metrics and progress with early stopping"""
     
-    def __init__(self):
+    def __init__(self, patience: int = 100):
         self.losses = []
         self.gradient_norms = []
         self.learning_rates = []
+        self.patience = patience
+        self.best_loss = float('inf')
+        self.epochs_without_improvement = 0
         
     def log_step(self, loss: float, grad_norm: float, lr: float):
         """Log metrics for a training step"""
@@ -139,16 +142,31 @@ class TrainingLogger:
         self.gradient_norms.append(grad_norm)
         self.learning_rates.append(lr)
         
+        # Early stopping logic
+        if loss < self.best_loss:
+            self.best_loss = loss
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
+            
+    def should_early_stop(self) -> bool:
+        """Check if training should stop early"""
+        return self.epochs_without_improvement >= self.patience
+        
     def print_progress(self, epoch: int, loss: float, grad_norm: float, lr: float):
-        """Print training progress"""
+        """Print training progress with early stopping info"""
         print(f"Epoch {epoch}: Loss = {loss:.6f}, Grad Norm = {grad_norm:.6f}, LR = {lr:.2e}")
+        if self.epochs_without_improvement > 0:
+            print(f"    No improvement for {self.epochs_without_improvement} epochs (patience: {self.patience})")
         
     def get_summary(self) -> dict:
         """Get training summary statistics"""
         return {
             'final_loss': self.losses[-1] if self.losses else 0,
             'final_grad_norm': self.gradient_norms[-1] if self.gradient_norms else 0,
-            'total_epochs': len(self.losses)
+            'total_epochs': len(self.losses),
+            'best_loss': self.best_loss,
+            'epochs_without_improvement': self.epochs_without_improvement
         }
 
 
@@ -167,6 +185,85 @@ def compute_gradient_norm(model: torch.nn.Module) -> float:
         if p.grad is not None:
             total_grad_norm += p.grad.data.norm(2).item() ** 2
     return total_grad_norm ** 0.5
+
+
+def apply_gradient_clipping_with_scaling(model: torch.nn.Module, max_norm: float = 1.0, 
+                                       adaptive: bool = True) -> float:
+    """
+    Apply adaptive gradient clipping with optional scaling.
+    
+    Args:
+        model: PyTorch model
+        max_norm: Maximum gradient norm
+        adaptive: Whether to use adaptive clipping based on gradient history
+        
+    Returns:
+        Gradient norm before clipping
+    """
+    # Compute gradient norm before clipping
+    grad_norm = compute_gradient_norm(model)
+    
+    if adaptive and grad_norm > max_norm * 2:
+        # If gradient is very large, use more aggressive clipping
+        effective_max_norm = max_norm * 0.5
+    else:
+        effective_max_norm = max_norm
+    
+    # Apply clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=effective_max_norm)
+    
+    return grad_norm
+
+
+def check_model_health(model: torch.nn.Module) -> dict:
+    """
+    Check model health indicators for debugging training instability.
+    
+    Args:
+        model: PyTorch model
+        
+    Returns:
+        Dictionary with health metrics
+    """
+    health_info = {
+        'has_nan_params': False,
+        'has_inf_params': False,
+        'has_nan_grads': False,
+        'has_inf_grads': False,
+        'large_params': 0,
+        'large_grads': 0,
+        'total_params': 0
+    }
+    
+    for name, param in model.named_parameters():
+        health_info['total_params'] += param.numel()
+        
+        # Check parameters
+        if torch.isnan(param).any():
+            health_info['has_nan_params'] = True
+            print(f"    ⚠️ NaN in parameter: {name}")
+            
+        if torch.isinf(param).any():
+            health_info['has_inf_params'] = True
+            print(f"    ⚠️ Inf in parameter: {name}")
+            
+        if (param.abs() > 10).any():
+            health_info['large_params'] += 1
+            
+        # Check gradients
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                health_info['has_nan_grads'] = True
+                print(f"    ⚠️ NaN in gradient: {name}")
+                
+            if torch.isinf(param.grad).any():
+                health_info['has_inf_grads'] = True
+                print(f"    ⚠️ Inf in gradient: {name}")
+                
+            if (param.grad.abs() > 10).any():
+                health_info['large_grads'] += 1
+    
+    return health_info
 
 
 def create_training_plots(logger: TrainingLogger, config_suffix: str = "", save_dir: str = ".") -> str:
@@ -343,13 +440,62 @@ def create_simple_sample_plot(samples: torch.Tensor, t_grid: torch.Tensor,
 
 
 def print_model_summary(model: torch.nn.Module, model_name: str = "Model"):
-    """Print model parameter summary"""
+    """Print model parameter summary with initialization info"""
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     print(f"\n📊 {model_name} Summary:")
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Print initialization info if available
+    if hasattr(model, 'init_method'):
+        print(f"Initialization: {model.init_method} (gain: {model.init_gain})")
+    if hasattr(model, 'dropout'):
+        print(f"Dropout rate: {model.dropout}")
+
+
+def create_model_variants_for_testing():
+    """
+    Create different model variants for testing initialization methods.
+    
+    Returns:
+        Dict of model configurations for stability testing
+    """
+    variants = {
+        'xavier_uniform_conservative': {
+            'init_method': 'xavier_uniform',
+            'init_gain': 0.05,
+            'dropout': 0.15
+        },
+        'xavier_normal_conservative': {
+            'init_method': 'xavier_normal', 
+            'init_gain': 0.05,
+            'dropout': 0.15
+        },
+        'xavier_uniform_standard': {
+            'init_method': 'xavier_uniform',
+            'init_gain': 0.1,
+            'dropout': 0.1
+        },
+        'xavier_normal_standard': {
+            'init_method': 'xavier_normal',
+            'init_gain': 0.1, 
+            'dropout': 0.1
+        },
+        'kaiming_uniform': {
+            'init_method': 'kaiming_uniform',
+            'init_gain': 0.1,
+            'dropout': 0.1
+        },
+        'orthogonal': {
+            'init_method': 'orthogonal',
+            'init_gain': 0.1,
+            'dropout': 0.1
+        }
+    }
+    
+    return variants
 
 
 def print_experiment_header(experiment_name: str, config: dict):

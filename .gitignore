@@ -6,3 +6,4 @@ oldplots/
 __pycache__/
 gifs
 *.png
+*.json

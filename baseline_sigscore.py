@@ -2,14 +2,17 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import argparse
+import json
+from pathlib import Path
 from signature_score_loss import SignatureScoreLoss
 from signature_models import TransformerModel, generate_ou_noise, add_noise
 from utils import (
     setup_diffusion_schedule, generate_sinusoidal_data, pregenerate_ou_noise,
-    get_cached_ou_noise, TrainingLogger, compute_gradient_norm, 
+    get_cached_ou_noise, TrainingLogger, 
     create_training_plots, create_sample_comparison_plot, create_simple_sample_plot,
     print_model_summary, print_experiment_header, print_training_complete,
-    test_strict_properness_debug
+    test_strict_properness_debug, apply_gradient_clipping_with_scaling, check_model_health
 )
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -18,21 +21,75 @@ torch.manual_seed(123)
 print(f"Using device: {device}")
 
 # ============================================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================================
+
+parser = argparse.ArgumentParser(description='Baseline Signature Scoring Diffusion with configurable parameters')
+
+# Model architecture
+parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension size')
+parser.add_argument('--num_layers', type=int, default=8, help='Number of transformer layers')
+parser.add_argument('--num_samples', type=int, default=8, help='Number of samples for signature scoring')
+parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+
+# Training parameters
+parser.add_argument('--batch_size', type=int, default=16, help='Training batch size')
+parser.add_argument('--num_epochs', type=int, default=500, help='Number of training epochs')
+parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
+parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+parser.add_argument('--lr_decay', type=float, default=0.995, help='Learning rate decay factor')
+parser.add_argument('--warmup_epochs', type=int, default=50, help='Learning rate warmup epochs')
+parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate')
+
+# Initialization parameters
+parser.add_argument('--init_method', type=str, default='xavier_uniform', 
+                   choices=['xavier_uniform', 'xavier_normal', 'kaiming_uniform', 'kaiming_normal', 'normal', 'orthogonal'],
+                   help='Weight initialization method')
+parser.add_argument('--init_gain', type=float, default=0.1, help='Initialization gain')
+
+# Signature loss parameters  
+parser.add_argument('--lambda_param', type=float, default=0.5, help='Lambda parameter for signature score')
+parser.add_argument('--dyadic_order', type=int, default=1, help='Dyadic order for signature computation')
+
+# Data parameters
+parser.add_argument('--N', type=int, default=200, help='Number of training samples')
+parser.add_argument('--T', type=int, default=100, help='Number of time points per sample')
+
+# Experiment parameters
+parser.add_argument('--experiment_name', type=str, default='baseline_sigscore', help='Experiment name for file naming')
+parser.add_argument('--save_logs', action='store_true', help='Save detailed training logs to JSON')
+
+args = parser.parse_args()
+
+# ============================================================================
 # EXPERIMENT CONFIGURATION
 # ============================================================================
 
 config = {
-    'N': 200,
-    'T': 100,  # Match baseline
-    'diffusion_steps': 100,
-    'hidden_dim': 64,
-    'num_samples': 8,
-    'batch_size': 16,  # Efficient batch processing like baseline
-    'num_epochs': 500,  # Match baseline epoch count
-    'learning_rate': 1e-4,
-    'weight_decay': 1e-5,
-    'lr_decay': 0.98
+    'N': args.N,
+    'T': args.T,
+    'diffusion_steps': 100,  # Fixed for now
+    'hidden_dim': args.hidden_dim,
+    'num_layers': args.num_layers,
+    'num_samples': args.num_samples,
+    'batch_size': args.batch_size,
+    'num_epochs': args.num_epochs,
+    'learning_rate': args.learning_rate,
+    'weight_decay': args.weight_decay,
+    'lr_decay': args.lr_decay,
+    'warmup_epochs': args.warmup_epochs,
+    'min_lr': args.min_lr,
+    'init_method': args.init_method,
+    'init_gain': args.init_gain,
+    'dropout': args.dropout,
+    'lambda_param': args.lambda_param,
+    'dyadic_order': args.dyadic_order,
+    'experiment_name': args.experiment_name,
+    'save_logs': args.save_logs
 }
+
+# Create descriptive suffix for file naming
+config_suffix = f"_{args.experiment_name}_init{args.init_method}_gain{args.init_gain}_drop{args.dropout}_lr{args.learning_rate}_lambda{args.lambda_param}_samples{args.num_samples}"
 
 print_experiment_header("Baseline Signature Scoring Diffusion", config)
 
@@ -55,9 +112,9 @@ gp_sigma = 0.05
 
 # Initialize signature score loss module
 signature_loss_fn = SignatureScoreLoss(
-    lambda_param=0.5,
+    lambda_param=config['lambda_param'],
     num_samples=config['num_samples'],
-    dyadic_order=1,
+    dyadic_order=config['dyadic_order'],
     clamp_range=(-50.0, 50.0)
 )
 
@@ -67,16 +124,40 @@ signature_loss_fn = SignatureScoreLoss(
 
 model = TransformerModel(
     dim=1, 
-    hidden_dim=config['hidden_dim'], 
+    hidden_dim=config['hidden_dim'],
+    num_layers=config['num_layers'],
     max_i=diffusion_steps, 
-    num_samples=config['num_samples']
+    num_samples=config['num_samples'],
+    dropout=config['dropout'],
+    init_method=config['init_method'],
+    init_gain=config['init_gain']
 ).to(device).double()
 
 print_model_summary(model, "Signature Scoring Transformer")
 
-# Optimizer and scheduler
-optim = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-scheduler = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=config['lr_decay'])
+# Optimizer with improved settings
+optim = torch.optim.Adam(
+    model.parameters(), 
+    lr=config['learning_rate'], 
+    weight_decay=config['weight_decay'],
+    betas=(0.9, 0.999),  # Standard Adam betas
+    eps=1e-8             # Prevent division by zero
+)
+
+# Learning rate scheduler with warmup
+def get_lr_lambda(epoch):
+    """Learning rate schedule with warmup"""
+    if epoch < config['warmup_epochs']:
+        # Linear warmup
+        return epoch / config['warmup_epochs']
+    else:
+        # Exponential decay after warmup
+        decay_epochs = epoch - config['warmup_epochs']
+        lr_factor = config['lr_decay'] ** decay_epochs
+        min_lr_factor = config['min_lr'] / config['learning_rate']
+        return max(lr_factor, min_lr_factor)
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=get_lr_lambda)
 
 # Training logger
 logger = TrainingLogger()
@@ -87,44 +168,53 @@ pregenerated_ou_noise = pregenerate_ou_noise(representative_t, config['num_sampl
 
 def get_signature_loss(x_batch, t_batch):
     """
-    Compute signature-based loss following baseline convention - process entire batch efficiently
+    Compute signature-based loss following Algorithm 1 from method.tex exactly
+    
+    Algorithm 1: Distributional Diffusion Model (training) for Time Series
     """
-    batch_size = x_batch.shape[0]
+    batch_size = x_batch.shape[0]  # n in algorithm
     
-    # Sample random diffusion steps (same as baseline)
-    i = torch.randint(0, diffusion_steps, size=(batch_size,), dtype=torch.int64)
-    i = i.view(-1, 1, 1).expand_as(x_batch[...,:1]).to(x_batch).double()
+    # Step 1: Sample t_i ~ U([0,1]) for i ∈ [n] (method.tex line 39)
+    # Sample continuous diffusion times, then convert to discrete steps
+    continuous_times = torch.rand(batch_size, dtype=torch.float64, device=device)  # t_i ~ U([0,1])
+    diffusion_steps_sampled = (continuous_times * (diffusion_steps - 1)).long()
+    diffusion_steps_tensor = diffusion_steps_sampled.view(-1, 1, 1).expand_as(x_batch[...,:1]).to(x_batch).double()
     
-    # Add noise to entire batch (same as baseline)
-    x_noisy, _ = add_noise(x_batch, t_batch, i, alphas, gp_sigma)
+    # Step 2: X_0^i are already sampled (x_batch) 
+    # Step 3: Sample X_{t_i}^i using forward diffusion process
+    x_noisy, _ = add_noise(x_batch, t_batch, diffusion_steps_tensor, alphas, gp_sigma)
     
-    # Generate multiple predictions for each batch item efficiently
+    # Steps 4-5: Sample ξ_ij ~ N(0, I_Md) and generate samples
+    # Generate m samples for each of n batch items
     all_predictions = []
-    for sample_idx in range(config['num_samples']):
-        # Generate OU noise for entire batch
+    for j in range(config['num_samples']):  # j ∈ [m] - population size
+        # Step 4: Sample ξ_ij ~ OU process for i ∈ [n], j ∈ [m]
         z_batch = []
-        for b in range(batch_size):
-            t_single = t_batch[b:b+1]  # [1, S, 1]
-            z_single = get_cached_ou_noise(pregenerated_ou_noise, t_single.shape, 1, device)[:, 0]  # [1, S, D]
-            z_batch.append(z_single)
-        z_batch = torch.cat(z_batch, dim=0)  # [batch_size, S, D]
+        for i in range(batch_size):  # i ∈ [n] - batch size
+            t_single = t_batch[i:i+1]  # [1, S, 1]
+            # Sample OU noise ξ_ij for this (i,j) pair
+            z_ij = get_cached_ou_noise(pregenerated_ou_noise, t_single.shape, 1, device)[:, 0]  # [1, S, D]
+            z_batch.append(z_ij)
+        z_batch = torch.cat(z_batch, dim=0)  # [batch_size, S, D] - all ξ_i,j for fixed j
         
-        # Single forward pass for entire batch with this Z
-        pred_batch = model(x_noisy, t_batch, i, z_batch)  # [batch_size, S, D]
+        # Step 5: Use generator P_θ to produce samples X̃_0^(i) (method.tex line 43)
+        pred_batch = model(x_noisy, t_batch, diffusion_steps_tensor, z_batch)  # [batch_size, S, D]
         all_predictions.append(pred_batch)
     
-    # Stack predictions: [num_samples, batch_size, S, D]
+    # Stack predictions: [m, n, S, D] - m samples for each of n batch items
     predictions = torch.stack(all_predictions, dim=0)
     
-    # Compute signature loss for each batch item
+    # Step 6: Compute L_sig (method.tex line 44)
     total_loss = 0.0
-    for b in range(batch_size):
-        pred_samples_b = predictions[:, b]  # [num_samples, S, D]
-        target_b = x_batch[b]               # [S, D]
-        time_b = t_batch[b, :, 0]           # [S] - remove last dimension for signature loss
+    for i in range(batch_size):  # For each batch item i ∈ [n]
+        # Get m samples for batch item i
+        pred_samples_i = predictions[:, i]  # [m, S, D] - X̃_0^(i) samples
+        target_i = x_batch[i]               # [S, D] - X_0^i target
+        time_i = t_batch[i, :, 0]           # [S] - time points for signature
         
-        loss_b = signature_loss_fn(pred_samples_b, target_b, time_b)
-        total_loss += loss_b
+        # Compute signature score with signature level s (dyadic_order)
+        loss_i = signature_loss_fn(pred_samples_i, target_i, time_i)
+        total_loss += loss_i
     
     return total_loss / batch_size
 
@@ -174,35 +264,37 @@ def debug_signature_components(x_batch, t_batch, model, signature_loss_fn, devic
 # TRAINING LOOP
 # ============================================================================
 
-print("Starting signature scoring diffusion training...")
+print(f"Starting signature scoring diffusion training with {config['init_method']} initialization...")
 
-# Better initialization
-def init_weights(m):
-    if hasattr(m, 'weight') and m.weight is not None:
-        torch.nn.init.xavier_uniform_(m.weight, gain=0.5)
-    if hasattr(m, 'bias') and m.bias is not None:
-        torch.nn.init.zeros_(m.bias)
-
-model.apply(init_weights)
+# Note: Model uses built-in initialization based on config['init_method']
+print(f"🎯 Initialization: {config['init_method']} with gain {config['init_gain']}")
+print(f"🎯 Dropout rate: {config['dropout']}")
+print(f"🎯 Learning rate: {config['learning_rate']} with warmup over {config['warmup_epochs']} epochs")
 
 batch_size = config['batch_size']
 num_epochs = config['num_epochs']
 
-for epoch in tqdm(range(num_epochs)):
-    # Sample random batch (like baseline)
+for epoch in tqdm(range(num_epochs)):  # k = 1:M training steps (method.tex line 38)
+    # Steps 1-2: Sample data X_0^i ~ P_0 for i ∈ [n] (method.tex lines 39-40)
     batch_indices = torch.randperm(N)[:batch_size]
-    x_batch = x[batch_indices]
-    t_batch = t[batch_indices]
+    x_batch = x[batch_indices]  # X_0^i samples
+    t_batch = t[batch_indices]  # Time grids for each sample
     
     optim.zero_grad()
-    loss = get_signature_loss(x_batch, t_batch)  # Now processes batch efficiently like baseline
+    # Steps 3-6: Forward diffusion, OU sampling, generation, and loss computation
+    loss = get_signature_loss(x_batch, t_batch)  # Implements lines 41-44
+    
+    # Check for NaN/Inf in loss
+    if torch.isnan(loss) or torch.isinf(loss):
+        print(f"❌ Invalid loss at epoch {epoch}: {loss.item()}")
+        print("🏥 Running emergency model health check...")
+        health = check_model_health(model)
+        break
+    
     loss.backward()
     
-    # Gradient clipping for stability
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
-    # Compute gradient norm
-    grad_norm = compute_gradient_norm(model)
+    # Enhanced gradient clipping with adaptive scaling
+    grad_norm = apply_gradient_clipping_with_scaling(model, max_norm=1.0, adaptive=True)
     
     optim.step()
     scheduler.step()
@@ -210,6 +302,11 @@ for epoch in tqdm(range(num_epochs)):
     # Log metrics
     current_lr = scheduler.get_last_lr()[0]
     logger.log_step(loss.item(), grad_norm, current_lr)
+    
+    # Early stopping check
+    if logger.should_early_stop():
+        print(f"🛑 Early stopping at epoch {epoch} - no improvement for {logger.patience} epochs")
+        break
     
     if epoch % 50 == 0:
         logger.print_progress(epoch, loss.item(), grad_norm, current_lr)
@@ -229,7 +326,7 @@ for epoch in tqdm(range(num_epochs)):
                     improvement = ((early_avg - recent_avg) / early_avg) * 100
                     print(f"    ✅ Loss decreasing: {improvement:.2f}% improvement")
         
-        # Debug signature components every 200 epochs
+        # Debug signature components and model health every 200 epochs
         if epoch % 200 == 0 and epoch > 0:
             print("🔍 Debugging Signature Loss Components...")
             
@@ -243,6 +340,14 @@ for epoch in tqdm(range(num_epochs)):
                 print(f"    Samples:     {component_info['num_samples']}")
             else:
                 print(f"    Error: {component_info['error']}")
+            
+            # Check model health
+            print("🏥 Model Health Check...")
+            health = check_model_health(model)
+            if health['has_nan_params'] or health['has_inf_params'] or health['has_nan_grads'] or health['has_inf_grads']:
+                print("    ❌ Model health issues detected!")
+            else:
+                print(f"    ✅ Model healthy - {health['large_params']} large params, {health['large_grads']} large grads")
             print()
         
         # Debug strict properness every 100 epochs
@@ -280,58 +385,86 @@ print_training_complete(logger, "Baseline Signature Scoring")
 # ============================================================================
 
 @torch.no_grad()
-def sample_signature(t_grid, num_samples=20):
+def sample_single_trajectory(t_grid, eta=0.0):
     """
-    Generate samples using DDIM sampling with clean X_0 predictions
-    Similar to baseline but uses model's clean predictions
+    Generate ONE sample following Algorithm 2 from method.tex exactly.
+    
+    Algorithm 2 generates a single trajectory. To get multiple samples,
+    this function should be called multiple times.
     """
-    # Ensure t_grid has the right shape for a single batch element
+    # Ensure t_grid has the right shape
     if len(t_grid.shape) == 3:
         t_single_grid = t_grid[0:1]  # [1, S, 1]
     else:
         t_single_grid = t_grid.unsqueeze(0)  # [1, S, 1]
     
-    from signature_models import get_gp_covariance
-    cov = get_gp_covariance(t_single_grid, gp_sigma)
-    L = torch.linalg.cholesky(cov)
     
-    # Start with noise
-    x = L @ torch.randn(num_samples, t_single_grid.shape[1], 1, dtype=torch.float64, device=device)
+    # Step 1: Sample X_τN ~ N(0, I_Md) - use OU process (method.tex line 69)
+    x_current = generate_ou_noise(t_single_grid, 1, batch_size=1, theta=2.0, sigma=0.8)[:, 0]  # [1, S, D]
     
-    for diff_step in reversed(range(0, diffusion_steps)):
-        alpha = alphas[diff_step]
-        beta = betas[diff_step]
+    # Step 2: For k ∈ {N-1, ..., 0} (method.tex line 70)
+    for diff_step in reversed(range(0, diffusion_steps)):  # k ∈ {N-1, ..., 0}
+        alpha_current = alphas[diff_step]      # α̅_τk (current step)
         
-        # Generate samples for each trajectory
-        all_samples = []
-        for sample_idx in range(num_samples):
-            x_single = x[sample_idx:sample_idx+1]  # [1, S, 1]
-            t_single = t_single_grid  # [1, S, 1] 
-            i_single = torch.tensor([diff_step], dtype=torch.float64).expand_as(x_single[...,:1]).to(device)
-            
-            # Generate single OU noise for this sample
-            z_single = generate_ou_noise(t_single, 1, batch_size=1, theta=2.0, sigma=0.8)[:, 0]  # [1, S, D]
-            
-            # Get clean X_0 prediction from model with OU noise input
-            pred_x0 = model(x_single, t_single, i_single, z_single)  # [1, S, D]
-            
-            # DDIM update using predicted clean sample
-            # x_t = sqrt(alpha) * x_0 + sqrt(1-alpha) * noise
-            # So: noise = (x_t - sqrt(alpha) * x_0) / sqrt(1-alpha)
-            pred_noise = (x_single - alpha.sqrt() * pred_x0) / (1 - alpha).sqrt().clamp(min=1e-8)
-            
-            # Standard DDIM update (same as baseline)
-            x_single = (x_single - beta * pred_noise / (1 - alpha).sqrt().clamp(min=1e-8)) / (1 - beta).sqrt().clamp(min=1e-8)
-            
-            if diff_step > 0:
-                z = L @ torch.randn_like(x_single)
-                x_single = x_single + beta.sqrt() * z
-                
-            all_samples.append(x_single)
+        # Compute alpha for previous step
+        if diff_step > 0:
+            alpha_prev = alphas[diff_step - 1]     # α̅_τ(k-1) (previous step)
+        else:
+            alpha_prev = torch.tensor(1.0, device=device)  # α̅_0 = 1
         
-        x = torch.cat(all_samples, dim=0)
+        t_single = t_single_grid                # [1, S, 1] 
+        i_single = torch.tensor([diff_step], dtype=torch.float64).expand_as(x_current[...,:1]).to(device)
+        
+        # Step 3: Sample Z ~ N(0, I_Md) - use OU process (method.tex line 71)
+        Z_ou = generate_ou_noise(t_single, 1, batch_size=1, theta=2.0, sigma=0.8)[:, 0]  # [1, S, D]
+        
+        # Step 4: Sample ξ ~ N(0, I_Md) - use OU process (method.tex line 72)
+        xi_ou = generate_ou_noise(t_single, 1, batch_size=1, theta=2.0, sigma=0.8)[:, 0]  # [1, S, D]
+        
+        # Step 5: Sample X̃_0 ~ P_θ(·|X_τk, τk, ξ) (method.tex line 73)
+        pred_x0 = model(x_current, t_single, i_single, xi_ou)  # [1, S, D]
+        
+        # Step 6: Compute D_τk = (X_τk - √α̅_τk X̃_0) / √(1-α̅_τk) (method.tex line 74)
+        D_t = (x_current - alpha_current.sqrt() * pred_x0) / (1 - alpha_current).sqrt().clamp(min=1e-8)
+        
+        # Step 7: Compute covariance term Σ_τ(k-1)^(1/2) (method.tex lines 75-78)
+        if diff_step > 0 and eta > 0:
+            # Optional DDIM covariance (method.tex lines 75-77)
+            covariance_factor = eta * torch.sqrt(
+                (1 - alpha_prev) / (1 - alpha_current) * 
+                (1 - alpha_current / alpha_prev)
+            ).clamp(min=1e-8)
+            
+            # Covariance noise using OU process instead of I_Md
+            covariance_noise = covariance_factor * Z_ou  # Use Z from step 3
+        else:
+            covariance_noise = torch.zeros_like(x_current)
+        
+        # Step 8: Compute X_τ(k-1) = √α̅_s X̃_0 + √(1-α̅_s) D_τk + Σ_τ(k-1)^(1/2) (method.tex line 79)
+        x_current = (alpha_prev.sqrt() * pred_x0 + 
+                    (1 - alpha_prev).sqrt() * D_t + 
+                    covariance_noise)
     
-    return x
+    # Return single sample [1, S, D]
+    return x_current
+
+
+@torch.no_grad()
+def sample_signature(t_grid, num_samples=20, eta=0.0):
+    """
+    Generate multiple samples by calling Algorithm 2 multiple times.
+    
+    Algorithm 2 generates ONE sample. To get num_samples, we call it num_samples times.
+    """
+    all_samples = []
+    
+    for sample_idx in range(num_samples):
+        # Call Algorithm 2 to generate ONE sample
+        single_sample = sample_single_trajectory(t_grid, eta=eta)  # [1, S, D]
+        all_samples.append(single_sample)
+    
+    # Stack all samples: [num_samples, S, D]
+    return torch.cat(all_samples, dim=0)
 
 # ============================================================================
 # EVALUATION AND VISUALIZATION
@@ -344,21 +477,33 @@ t_grid = torch.linspace(0, 1, T, dtype=torch.float64).view(1, -1, 1).to(device)
 num_generated_samples = 20
 samples = sample_signature(t_grid, num_generated_samples)
 
-# Create visualizations using utility functions
-config_suffix = "_baseline_sigscore"
-
-# Training metrics plot
+# Create visualizations using utility functions with descriptive suffix
 training_plot_path = create_training_plots(logger, config_suffix)
-
-# Sample comparison plot
 comparison_plot_path = create_sample_comparison_plot(samples, x, t_grid, t, config_suffix)
 
-# Simple samples plot
+# Create title with configuration info
+title = f"Generated Samples - {args.experiment_name}\nInit: {args.init_method}, λ={args.lambda_param}, Samples={args.num_samples}"
 samples_plot_path = create_simple_sample_plot(
-    samples, t_grid, 
-    title="10 Generated Samples - Baseline Signature Scoring Diffusion", 
-    config_suffix=config_suffix
+    samples, t_grid, title=title, config_suffix=config_suffix
 )
+
+# Save training logs if requested
+if config['save_logs']:
+    log_data = {
+        'config': config,
+        'training_metrics': {
+            'losses': logger.losses,
+            'gradient_norms': logger.gradient_norms,
+            'learning_rates': logger.learning_rates
+        },
+        'final_summary': logger.get_summary()
+    }
+    
+    log_filename = f"training_log{config_suffix}.json"
+    with open(log_filename, 'w') as f:
+        json.dump(log_data, f, indent=2)
+    
+    print(f"📄 Training log saved: {log_filename}")
 
 print("✅ Analysis complete!")
 print(f"\nFiles generated:")
@@ -366,10 +511,13 @@ print(f"- {training_plot_path}")
 print(f"- {comparison_plot_path}")  
 print(f"- {samples_plot_path}")
 
-# Print final summary
+# Print final summary with configuration
 summary = logger.get_summary()
-print(f"\n🏆 BASELINE SIGNATURE SCORING SUMMARY:")
+print(f"\n🏆 EXPERIMENT SUMMARY: {args.experiment_name}")
+print(f"Configuration: {args.init_method} init, gain={args.init_gain}, dropout={args.dropout}")
 print(f"Final Loss: {summary['final_loss']:.6f}")
+print(f"Best Loss: {summary['best_loss']:.6f}")
 print(f"Final Gradient Norm: {summary['final_grad_norm']:.6f}")
 print(f"Total Epochs: {summary['total_epochs']}")
+print(f"Early Stop: {'Yes' if summary['epochs_without_improvement'] >= 100 else 'No'}")
 print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
